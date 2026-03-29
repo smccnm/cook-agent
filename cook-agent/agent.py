@@ -1,106 +1,33 @@
-"""Agent orchestration compatibility layer.
+"""Agent orchestration layer for the streaming meal-plan workflow."""
 
-This file keeps the current public function names stable while later tasks
-move planning, generation, and streaming responsibilities into dedicated
-modules.
-"""
+from __future__ import annotations
 
-import json
+import asyncio
 import logging
 import os
 from typing import Any, AsyncGenerator
 
 from openai import AsyncOpenAI
 
+from generation import MealGenerationService
 from models import RetrievedRecipe, UserMenuConstraints
 from planning import PlanningService
-from retrieval import CaptchaDetectedError, retrieve_recipes
+from retrieval import FallbackRetriever
 
 logger = logging.getLogger(__name__)
 
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4-turbo-preview")
-planning_service = PlanningService(openai_client=client)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-
-def _chunk_text(text: str, chunk_size: int = 120) -> list[str]:
-    if not text:
-        return []
-    return [text[index : index + chunk_size] for index in range(0, len(text), chunk_size)]
-
-
-def _local_meal_plan_markdown(
-    constraints: UserMenuConstraints,
-    retrieved_recipes: list[RetrievedRecipe],
-) -> str:
-    ingredients = ", ".join(
-        f"{item.name} {item.quantity}" for item in constraints.available_ingredients
-    ) or "available pantry items"
-    dislikes = ", ".join(constraints.allergies_and_dislikes) or "none"
-    inspiration = ", ".join(recipe.title for recipe in retrieved_recipes[:3] if recipe.title)
-    inspiration_line = inspiration or "current retrieval hints"
-
-    return (
-        "### Chef Allocation Summary\n\n"
-        f"- Inventory: {ingredients}\n"
-        f"- Portions: {constraints.portion_size}\n"
-        f"- Global request: {constraints.global_requests or 'flexible home meal'}\n"
-        f"- Avoid: {dislikes}\n"
-        f"- Inspiration: {inspiration_line}\n\n"
-        "### Draft Menu\n\n"
-        "#### Ingredients\n"
-        f"- {ingredients}\n\n"
-        "#### Steps\n"
-        "1. Review the available ingredients and reserve enough for every dish.\n"
-        "2. Start with the quickest dish and reuse overlapping prep.\n"
-        "3. Adjust seasoning to match the user's dislikes and preferences.\n"
-    )
-
-
-async def _generate_markdown(
-    constraints: UserMenuConstraints,
-    retrieved_recipes: list[RetrievedRecipe],
-) -> str:
-    if os.getenv("OPENAI_API_KEY", "").strip():
-        prompt = (
-            "Create a markdown meal plan that starts with '### Chef Allocation Summary'.\n"
-            f"Inventory: {json.dumps([item.model_dump() for item in constraints.available_ingredients], ensure_ascii=False)}\n"
-            f"Portions: {constraints.portion_size}\n"
-            f"Global request: {constraints.global_requests}\n"
-            f"Dislikes: {json.dumps(constraints.allergies_and_dislikes, ensure_ascii=False)}\n"
-            f"Inspiration: {json.dumps([recipe.model_dump() for recipe in retrieved_recipes[:5]], ensure_ascii=False)}\n"
-        )
-        try:
-            response = await client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a careful home cooking planner. Return markdown only.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-            )
-            content = response.choices[0].message.content or ""
-            if content.strip():
-                return content
-        except Exception as exc:
-            logger.warning("[Node 3] OpenAI generation failed, falling back locally: %s", exc)
-
-    return _local_meal_plan_markdown(constraints, retrieved_recipes)
+planning_service = PlanningService(openai_client=openai_client)
+generation_service = MealGenerationService(openai_client=openai_client)
 
 
 async def node_1_planning_extract(user_input: str) -> UserMenuConstraints:
-    """Node 1 planning through an OpenAI-first service with local fallback."""
+    """Plan the meal request with OpenAI-first / local-fallback behavior."""
 
     logger.info("[Node 1] planning input: %s...", user_input[:100])
-    try:
-        constraints = await planning_service.plan(user_input)
-    except Exception as exc:
-        logger.error("[Node 1] planning failure: %s", exc)
-        raise ValueError(f"Planning service failure: {exc}") from exc
-
+    constraints = await planning_service.plan(user_input)
     logger.info(
         "[Node 1] planning completed with %s search queries",
         len(constraints.search_queries),
@@ -109,43 +36,48 @@ async def node_1_planning_extract(user_input: str) -> UserMenuConstraints:
 
 
 async def node_2_concurrent_retrieval(
-    queries: list[str],
+    queries: list[str], max_concurrent: int = 3
 ) -> tuple[list[RetrievedRecipe], list[dict[str, Any]]]:
-    """Node 2 retrieval wrapper with query-level failure insulation."""
+    """Run query retrieval and return both recipes and query-level updates."""
 
-    logger.info("[Node 2] retrieval starting with %s queries", len(queries))
-    try:
-        success_results, failed_queries = await retrieve_recipes(queries)
-        logger.info(
-            "[Node 2] retrieval completed: %s successes, %s failures",
-            len(success_results),
-            len(failed_queries),
-        )
-        return success_results, failed_queries
-    except CaptchaDetectedError as exc:
-        logger.error("[Node 2] captcha detected: %s", exc)
-        return [], [{"query": "all", "reason": "captcha_detected"}]
-    except Exception as exc:
-        logger.error("[Node 2] retrieval failure: %s", exc)
-        return [], [{"query": "all", "reason": str(exc)}]
+    retriever = FallbackRetriever()
+    semaphore = asyncio.Semaphore(max_concurrent)
+    recipes: list[RetrievedRecipe] = []
+    updates: list[dict[str, Any]] = []
+
+    async def guarded(query: str) -> tuple[RetrievedRecipe | None, dict[str, Any]]:
+        async with semaphore:
+            return await retriever.retrieve_query(query)
+
+    tasks = [asyncio.create_task(guarded(query)) for query in queries]
+    for task in asyncio.as_completed(tasks):
+        recipe, update = await task
+        if recipe is not None:
+            recipes.append(recipe)
+        updates.append(update)
+
+    logger.info(
+        "[Node 2] retrieval completed with %s recipes and %s updates",
+        len(recipes),
+        len(updates),
+    )
+    return recipes, updates
 
 
 async def node_3_generate_meal_plan_stream(
     constraints: UserMenuConstraints,
     retrieved_recipes: list[RetrievedRecipe],
 ) -> AsyncGenerator[str, None]:
-    """Temporary streaming layer until Task 4 introduces generation.py."""
+    """Stream generation chunks from the shared generation service."""
 
-    logger.info("[Node 3] generation starting")
-    markdown = await _generate_markdown(constraints, retrieved_recipes)
-    for chunk in _chunk_text(markdown):
+    async for chunk in generation_service.stream(constraints, retrieved_recipes):
         yield chunk
 
 
 async def process_agent_stream(
     user_input: str,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Run the three-stage agent flow and emit SSE-friendly event payloads."""
+    """Run the full agent workflow and emit SSE-friendly event payloads."""
 
     try:
         constraints = await node_1_planning_extract(user_input)
@@ -154,18 +86,13 @@ async def process_agent_stream(
             "data": constraints.model_dump(),
         }
 
-        retrieved_recipes, _failed_queries = await node_2_concurrent_retrieval(
+        retrieved_recipes, updates = await node_2_concurrent_retrieval(
             constraints.search_queries
         )
-
-        for query in constraints.search_queries:
-            is_success = any(recipe.source_query == query for recipe in retrieved_recipes)
+        for update in updates:
             yield {
                 "event": "retrieval_update",
-                "data": {
-                    "query": query,
-                    "status": "success" if is_success else "fail",
-                },
+                "data": update,
             }
 
         async for chunk in node_3_generate_meal_plan_stream(
@@ -175,8 +102,13 @@ async def process_agent_stream(
                 "event": "recipe_stream",
                 "data": {"chunk": chunk},
             }
+
+        yield {
+            "event": "recipe_done",
+            "data": {"status": "complete"},
+        }
     except Exception as exc:
-        logger.error("[Agent] pipeline failure: %s", exc)
+        logger.exception("[Agent] pipeline failure")
         yield {
             "event": "error",
             "data": {"message": str(exc)},
