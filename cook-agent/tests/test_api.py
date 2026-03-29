@@ -38,3 +38,16 @@ def test_stream_route_emits_expected_event_names(monkeypatch):
     assert "planning_done" in body
     assert "retrieval_update" in body
     assert "recipe_stream" in body
+
+
+def test_stream_route_works_without_optional_credentials(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("BING_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("XHS_COOKIE", raising=False)
+    monkeypatch.delenv("A1", raising=False)
+
+    client = TestClient(app)
+    response = client.get("/api/v1/stream_meal_plan", params={"user_input": "我有鸡蛋和番茄"})
+
+    assert response.status_code == 200
+    assert "planning_done" in response.text
