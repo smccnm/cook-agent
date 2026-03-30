@@ -1,48 +1,62 @@
+from __future__ import annotations
+
 import json
 import re
 from itertools import combinations
 from typing import Iterable
 
+from google import genai
+from google.genai import types
+
 from models import IngredientItem, UserMenuConstraints
 from settings import AppSettings
 
+PLANNING_SYSTEM_PROMPT = """你是一个极其严谨的美食统筹大脑兼高级搜索算法工程师。
+你的任务是把用户模糊、非结构化的自然语言需求转换为严格的 JSON 规划书。
 
-_INGREDIENT_STOP_WORDS = {
-    "我",
-    "我们",
-    "有",
-    "想",
-    "做",
-    "晚上",
-    "中午",
-    "早上",
-    "今天",
-    "明天",
-    "个人",
-    "人",
-    "晚餐",
-    "午餐",
-    "早餐",
-    "不吃",
-    "不要",
-    "两菜一汤",
-}
+必须遵守：
+1. 精确提取食材名称和数量，未说明数量时填“适量”。
+2. 提取绝对忌口，放入 allergies_and_dislikes。
+3. 结合原始食材组合、经典菜名猜想、宏观场景补足，输出 4 到 8 个 search_queries。
+4. search_queries 必须是“关键词空格组合”，不能是完整句子。
+5. 如果用户不吃某类食材，绝不能在 query 中引入冲突菜名或关键词。
 
-_KNOWN_INGREDIENTS = (
+输出必须严格符合 UserMenuConstraints 对应 JSON 结构，不要输出解释文字。"""
+
+KNOWN_INGREDIENTS = (
     "番茄",
     "西红柿",
     "鸡蛋",
     "土豆",
     "茄子",
     "黄瓜",
-    "青椒",
-    "豆腐",
+    "五花肉",
     "牛肉",
-    "猪肉",
+    "豆腐",
+    "白菜",
+    "豆角",
     "排骨",
+    "虾",
+    "鱼",
 )
 
-_CN_NUM_MAP = {
+STOP_WORDS = {
+    "我",
+    "我们",
+    "有",
+    "想",
+    "做",
+    "晚上",
+    "今天",
+    "明天",
+    "一个",
+    "两个人",
+    "不吃",
+    "不要",
+    "讨厌",
+}
+
+CN_NUMBERS = {
     "零": 0,
     "一": 1,
     "二": 2,
@@ -58,126 +72,101 @@ _CN_NUM_MAP = {
 }
 
 
-def _normalize_text(text: str) -> str:
-    return text.replace("，", ",").replace("。", ".").replace("；", ";").strip()
-
-
-def _normalize_ingredient_name(name: str) -> str:
-    normalized = name.strip()
-    if normalized == "西红柿":
-        return "番茄"
-    return normalized
-
-
-def _contains_stop_word(token: str) -> bool:
-    return token in _INGREDIENT_STOP_WORDS or len(token) <= 1
-
-
-def _parse_cn_number(text: str) -> int | None:
-    if not text:
-        return None
-    if text in _CN_NUM_MAP:
-        return _CN_NUM_MAP[text]
-    if text == "十":
-        return 10
-    if text.startswith("十"):
-        return 10 + _CN_NUM_MAP.get(text[1:], 0)
-    if text.endswith("十"):
-        return _CN_NUM_MAP.get(text[0], 1) * 10
-    if "十" in text and len(text) == 3:
-        return _CN_NUM_MAP.get(text[0], 0) * 10 + _CN_NUM_MAP.get(text[2], 0)
-    return None
-
-
 def _dedupe(items: Iterable[str]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for item in items:
         if not item or item in seen:
             continue
-        seen.add(item)
         result.append(item)
+        seen.add(item)
     return result
 
 
+def _normalize_name(name: str) -> str:
+    if name == "西红柿":
+        return "番茄"
+    return name.strip()
+
+
+def _contains_stop_word(token: str) -> bool:
+    return token in STOP_WORDS or len(token) <= 1
+
+
+def _parse_cn_number(text: str) -> int | None:
+    if not text:
+        return None
+    if text in CN_NUMBERS:
+        return CN_NUMBERS[text]
+    if text == "十":
+        return 10
+    if text.startswith("十"):
+        return 10 + CN_NUMBERS.get(text[1:], 0)
+    if text.endswith("十"):
+        return CN_NUMBERS.get(text[0], 1) * 10
+    if "十" in text and len(text) == 3:
+        return CN_NUMBERS.get(text[0], 0) * 10 + CN_NUMBERS.get(text[2], 0)
+    return None
+
+
 def extract_ingredients(user_input: str) -> list[IngredientItem]:
-    text = _normalize_text(user_input)
     ingredients: list[IngredientItem] = []
     seen: set[str] = set()
 
     quantity_pattern = re.compile(
-        r"(\d+\s*(?:个|斤|克|g|kg|颗|根|只|条|块|勺|碗|ml|毫升)?)\s*([\u4e00-\u9fff]{1,8})"
+        r"(\d+\s*(?:个|克|g|kg|斤|两|ml|毫升)?)\s*([\u4e00-\u9fff]{1,8})"
     )
-    for match in quantity_pattern.finditer(text):
+    for match in quantity_pattern.finditer(user_input):
         quantity = match.group(1).strip()
-        name = _normalize_ingredient_name(match.group(2).strip())
-        if _contains_stop_word(name):
+        name = _normalize_name(match.group(2).strip())
+        if _contains_stop_word(name) or name in seen:
             continue
-        if name in seen:
-            continue
-        seen.add(name)
         ingredients.append(IngredientItem(name=name, quantity=quantity))
+        seen.add(name)
 
-    segment_match = re.search(r"有([^。！？!?]+)", user_input)
-    if segment_match:
-        raw_segment = segment_match.group(1)
-        segment = re.split(r"[，,。;；](?:晚上|中午|早上|想|不|给|做)", raw_segment)[0]
-        tokens = re.split(r"[、,，和及与 ]+", segment)
-        for token in tokens:
-            token = _normalize_ingredient_name(re.sub(r"[^\u4e00-\u9fff]", "", token))
-            if _contains_stop_word(token):
-                continue
-            if token in seen:
-                continue
-            seen.add(token)
-            ingredients.append(IngredientItem(name=token, quantity="适量"))
-
-    if not ingredients:
-        for candidate in _KNOWN_INGREDIENTS:
-            if candidate in user_input and candidate not in seen:
-                ingredients.append(IngredientItem(name=candidate, quantity="适量"))
-                seen.add(candidate)
+    for candidate in KNOWN_INGREDIENTS:
+        normalized = _normalize_name(candidate)
+        if candidate in user_input and normalized not in seen:
+            ingredients.append(IngredientItem(name=normalized, quantity="适量"))
+            seen.add(normalized)
 
     return ingredients
 
 
 def extract_dislikes(user_input: str) -> list[str]:
     dislikes: list[str] = []
-    for prefix in ("不吃", "不要", "不放", "讨厌"):
-        pattern = re.compile(rf"{prefix}\s*([^\s，。,；;、]+)")
+    for prefix in ("不吃", "不要", "讨厌", "过敏"):
+        pattern = re.compile(rf"{prefix}\s*([^\s，。；、]+)")
         for match in pattern.finditer(user_input):
-            dislikes.append(f"{prefix}{match.group(1)}")
+            dislikes.append(match.group(1))
     return _dedupe(dislikes)
 
 
 def extract_portion_size(user_input: str) -> int:
-    digit_match = re.search(r"(\d+)\s*(?:个)?(?:人|位)", user_input)
+    digit_match = re.search(r"(\d+)\s*(?:人|个人|位)", user_input)
     if digit_match:
         return max(int(digit_match.group(1)), 1)
 
-    cn_match = re.search(r"([零一二两三四五六七八九十]{1,3})\s*(?:个)?(?:人|位)", user_input)
+    cn_match = re.search(r"([零一二两三四五六七八九十]{1,3})\s*(?:人|个人|位)", user_input)
     if cn_match:
-        parsed = _parse_cn_number(cn_match.group(1))
-        if parsed:
-            return max(parsed, 1)
-
+        value = _parse_cn_number(cn_match.group(1))
+        if value:
+            return max(value, 1)
     return 1
 
 
 def extract_global_request(user_input: str) -> str:
     requests: list[str] = []
     if "晚上吃" in user_input:
-        requests.append("晚上吃")
-
-    scene_match = re.search(r"([一二两三四五六七八九十\d]+菜[一二两三四五六七八九十\d]+汤)", user_input)
-    if scene_match:
-        requests.append(scene_match.group(1))
-
-    for keyword in ("减脂", "清淡", "快手", "下饭"):
+        requests.append("易消化")
+    if "两菜一汤" in user_input:
+        requests.append("两菜一汤")
+    if "一荤一素" in user_input:
+        requests.append("一荤一素")
+    for keyword in ("减脂", "清淡", "不辣", "快手", "下饭"):
         if keyword in user_input:
             requests.append(keyword)
-
-    return "；".join(_dedupe(requests))
+    return "；".join(_dedupe(requests)) or "家常餐"
 
 
 def build_keyword_queries(
@@ -186,54 +175,43 @@ def build_keyword_queries(
     global_requests: str,
 ) -> list[str]:
     ingredient_names = [item.name for item in ingredients] or ["家常菜"]
-    dislike_terms: list[str] = []
-    if any("辣" in item for item in dislikes):
-        dislike_terms.append("不辣")
-    scene_terms = [part for part in global_requests.split("；") if part]
-    modifier_terms = _dedupe(scene_terms + dislike_terms)
-
     queries: list[str] = []
-    joined = " ".join(ingredient_names[:3])
-    queries.append(f"{joined} 家常 做法".strip())
-    queries.append(f"{joined} 快手 菜谱".strip())
+    dislike_terms = ["不辣"] if any(item in {"辣", "辣椒"} for item in dislikes) else []
+    scene_terms = [item for item in global_requests.split("；") if item]
 
-    for left, right in combinations(ingredient_names[:4], 2):
-        queries.append(f"{left} {right} 做法")
+    for combo_size in (2, 3):
+        for combo in combinations(ingredient_names[:4], min(combo_size, len(ingredient_names[:4]))):
+            base = " ".join(combo)
+            queries.append(f"{base} 做法")
+            queries.append(f"{base} 神仙吃法")
 
-    for modifier in modifier_terms:
-        queries.append(f"{joined} {modifier} 做法".strip())
+    classic_pairs = {
+        frozenset({"土豆", "茄子"}): ["少油版 地三鲜", "空气炸锅 地三鲜"],
+        frozenset({"番茄", "鸡蛋"}): ["番茄 炒蛋 家常", "番茄 鸡蛋 汤"],
+        frozenset({"豆腐", "白菜"}): ["豆腐 白菜 清淡", "白菜 豆腐 汤"],
+    }
+    existing = set(ingredient_names)
+    for pair, pair_queries in classic_pairs.items():
+        if pair.issubset(existing):
+            queries.extend(pair_queries)
 
-    if "两菜一汤" in global_requests:
-        queries.append(f"{joined} 两菜一汤 菜单".strip())
-        queries.append(f"{joined} 家常 汤 做法".strip())
-    elif "晚上吃" in global_requests:
-        queries.append(f"{joined} 晚餐 菜单".strip())
-        queries.append(f"{joined} 晚上吃 汤 做法".strip())
+    for term in scene_terms + dislike_terms:
+        queries.append(f"{' '.join(ingredient_names[:3])} {term}")
 
-    fallback_queries = [
-        f"{joined} 少油 做法".strip(),
-        f"{joined} 清淡 菜谱".strip(),
-        f"{joined} 下饭 家常菜".strip(),
-        f"{joined} 汤 做法".strip(),
-    ]
-
-    deduped = _dedupe(queries)
-    for fallback in fallback_queries:
-        if len(deduped) >= 4:
+    filtered = []
+    for query in _dedupe(queries):
+        if any(dislike and dislike in query for dislike in dislikes):
+            continue
+        filtered.append(query)
+        if len(filtered) == 8:
             break
-        if fallback not in deduped:
-            deduped.append(fallback)
 
-    return deduped[:8]
+    while len(filtered) < 4:
+        fallback = f"{' '.join(ingredient_names[:2])} 家常 做法 {len(filtered)+1}"
+        if fallback not in filtered:
+            filtered.append(fallback)
 
-
-def _extract_json_payload(raw_content: str) -> dict:
-    content = raw_content.strip()
-    if "```json" in content:
-        content = content.split("```json", 1)[1].split("```", 1)[0].strip()
-    elif content.startswith("```") and content.endswith("```"):
-        content = content.strip("`").strip()
-    return json.loads(content)
+    return filtered[:8]
 
 
 class LocalPlanningService:
@@ -242,11 +220,7 @@ class LocalPlanningService:
         dislikes = extract_dislikes(user_input)
         portion_size = extract_portion_size(user_input)
         global_requests = extract_global_request(user_input)
-        search_queries = build_keyword_queries(
-            ingredients=ingredients,
-            dislikes=dislikes,
-            global_requests=global_requests,
-        )
+        search_queries = build_keyword_queries(ingredients, dislikes, global_requests)
         return UserMenuConstraints(
             available_ingredients=ingredients,
             allergies_and_dislikes=dislikes,
@@ -263,11 +237,21 @@ class PlanningService:
         settings: AppSettings | None = None,
         local_service: LocalPlanningService | None = None,
     ) -> None:
-        self.openai_client = openai_client
         self.settings = settings or AppSettings()
         self.local_service = local_service or LocalPlanningService()
+        self.google_client = (
+            genai.Client(api_key=self.settings.gemini_api_key)
+            if self.settings.gemini_enabled
+            else None
+        )
+        self.openai_client = openai_client
 
     async def plan(self, user_input: str) -> UserMenuConstraints:
+        if self.google_client is not None:
+            try:
+                return await self._plan_with_gemini(user_input)
+            except Exception:
+                pass
         if self.openai_client and self.settings.openai_enabled:
             try:
                 return await self._plan_with_openai(user_input)
@@ -275,30 +259,36 @@ class PlanningService:
                 pass
         return self.local_service.plan(user_input)
 
+    async def _plan_with_gemini(self, user_input: str) -> UserMenuConstraints:
+        response = await self.google_client.aio.models.generate_content(
+            model=self.settings.gemini_planning_model,
+            contents=user_input,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                system_instruction=PLANNING_SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                response_schema=UserMenuConstraints,
+            ),
+        )
+        payload = json.loads(response.text)
+        constraints = UserMenuConstraints(**payload)
+        if not constraints.search_queries:
+            constraints.search_queries = build_keyword_queries(
+                constraints.available_ingredients,
+                constraints.allergies_and_dislikes,
+                constraints.global_requests,
+            )
+        return constraints
+
     async def _plan_with_openai(self, user_input: str) -> UserMenuConstraints:
         response = await self.openai_client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Extract structured cooking constraints as JSON with keys: "
-                        "available_ingredients, allergies_and_dislikes, portion_size, "
-                        "flavor_preferences, global_requests, search_queries."
-                    ),
-                },
+                {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
                 {"role": "user", "content": user_input},
             ],
             response_format={"type": "json_object"},
         )
-        content = response.choices[0].message.content or "{}"
-        payload = _extract_json_payload(content)
-        constraints = UserMenuConstraints(**payload)
-        if not constraints.search_queries:
-            constraints.search_queries = build_keyword_queries(
-                ingredients=constraints.available_ingredients,
-                dislikes=constraints.allergies_and_dislikes,
-                global_requests=constraints.global_requests,
-            )
-        return constraints
+        payload = json.loads(response.choices[0].message.content or "{}")
+        return UserMenuConstraints(**payload)

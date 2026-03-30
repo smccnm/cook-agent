@@ -1,6 +1,5 @@
-"""
-Multi-strategy retrieval cascade:
-MCP -> Schema(JSON-LD only) -> Bing(title/snippet) -> Playwright
+"""Retrieval cascade:
+MCP service -> Schema(JSON-LD) -> Bing(title/snippet) -> Playwright.
 """
 
 from __future__ import annotations
@@ -8,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import random
 from abc import ABC, abstractmethod
 from typing import Any, Optional
@@ -18,21 +16,23 @@ from bs4 import BeautifulSoup
 
 try:
     from fake_useragent import UserAgent
-except Exception:  # pragma: no cover - optional dependency in test env
+except Exception:  # pragma: no cover
     UserAgent = None
 
 try:
     from playwright.async_api import async_playwright
-except Exception:  # pragma: no cover - optional dependency in test env
+except Exception:  # pragma: no cover
     async_playwright = None
 
 from models import RetrievedRecipe, RetrievalStrategy
+from settings import AppSettings
+from xhs_service import XHSServiceManager
 
 logger = logging.getLogger(__name__)
 
 
 class CaptchaDetectedError(Exception):
-    """Raised when captcha is detected and we should stop page extraction."""
+    """Raised when captcha or anti-bot behavior is detected."""
 
 
 class RetrievalStrategy_ABC(ABC):
@@ -42,23 +42,51 @@ class RetrievalStrategy_ABC(ABC):
 
 
 class MCPRetrievalStrategy(RetrievalStrategy_ABC):
-    """MCP strategy placeholder; enabled only when required env vars exist."""
-
-    def __init__(self):
-        self.xhs_cookie = os.getenv("XHS_COOKIE", "")
-        self.a1 = os.getenv("A1", "")
-        self.enabled = bool(self.xhs_cookie and self.a1)
+    def __init__(
+        self,
+        settings: AppSettings | None = None,
+        xhs_manager: XHSServiceManager | None = None,
+    ) -> None:
+        self.settings = settings or AppSettings()
+        self.xhs_manager = xhs_manager or XHSServiceManager(self.settings)
 
     async def retrieve(self, query: str) -> Optional[RetrievedRecipe]:
-        if not self.enabled:
+        status = self.xhs_manager.login_status()
+        if not status["logged_in"]:
             return None
-        logger.info("MCP retrieval placeholder for query=%s", query)
-        return None
+
+        try:
+            items = await self.xhs_manager.search(query)
+        except Exception as exc:
+            logger.debug("MCP retrieval failed: %s", exc)
+            return None
+
+        first = items[0] if items else {}
+        title = (
+            first.get("noteCard", {}).get("displayTitle")
+            or first.get("displayTitle")
+            or first.get("title")
+            or ""
+        )
+        snippet = (
+            first.get("noteCard", {}).get("desc")
+            or first.get("desc")
+            or first.get("content")
+            or ""
+        )
+        if not title and not snippet:
+            return None
+
+        return RetrievedRecipe(
+            source_query=query,
+            source_strategy=RetrievalStrategy.MCP,
+            title=str(title),
+            instructions_or_snippet=str(snippet),
+            raw_content=json.dumps(first, ensure_ascii=False),
+        )
 
 
 class SchemaExtractionStrategy(RetrievalStrategy_ABC):
-    """Extract only Recipe JSON-LD schema from candidate pages."""
-
     WEBSITES = [
         {"url_template": "https://www.xiachufang.com/search/?kw={}", "name": "xiachufang"},
         {"url_template": "https://www.meishij.net/search?q={}", "name": "meishij"},
@@ -85,18 +113,17 @@ class SchemaExtractionStrategy(RetrievalStrategy_ABC):
         soup = BeautifulSoup(response.content, "lxml")
         scripts = soup.find_all("script", {"type": "application/ld+json"})
         for script in scripts:
-            script_body = script.string or script.get_text() or ""
-            if not script_body.strip():
+            raw = script.string or script.get_text() or ""
+            if not raw.strip():
                 continue
             try:
-                data = json.loads(script_body)
+                data = json.loads(raw)
             except json.JSONDecodeError:
                 continue
 
             recipe_schema = self._extract_recipe_schema(data)
             if recipe_schema is not None:
                 return self._parse_recipe_schema(recipe_schema, query)
-
         return None
 
     def _extract_recipe_schema(self, data: Any) -> Optional[dict[str, Any]]:
@@ -108,14 +135,10 @@ class SchemaExtractionStrategy(RetrievalStrategy_ABC):
                 for node in graph:
                     if isinstance(node, dict) and node.get("@type") == "Recipe":
                         return node
-            return None
-
-        if isinstance(data, list):
+        elif isinstance(data, list):
             for item in data:
                 if isinstance(item, dict) and item.get("@type") == "Recipe":
                     return item
-            return None
-
         return None
 
     def _parse_recipe_schema(self, schema_data: dict[str, Any], query: str) -> RetrievedRecipe:
@@ -127,13 +150,13 @@ class SchemaExtractionStrategy(RetrievalStrategy_ABC):
 
         instructions = schema_data.get("recipeInstructions", "")
         if isinstance(instructions, list):
-            instruction_parts: list[str] = []
+            parts: list[str] = []
             for step in instructions:
                 if isinstance(step, dict):
-                    instruction_parts.append(str(step.get("text", "")))
+                    parts.append(str(step.get("text", "")))
                 else:
-                    instruction_parts.append(str(step))
-            instructions = " ".join(part for part in instruction_parts if part)
+                    parts.append(str(step))
+            instructions = " ".join(part for part in parts if part)
         else:
             instructions = str(instructions or "")
 
@@ -148,14 +171,11 @@ class SchemaExtractionStrategy(RetrievalStrategy_ABC):
 
 
 class BingSearchStrategy(RetrievalStrategy_ABC):
-    """Use Bing Search API and return title+snippet only."""
-
-    def __init__(self):
-        self.api_key = os.getenv("BING_SEARCH_API_KEY", "")
-        self.enabled = bool(self.api_key)
+    def __init__(self, settings: AppSettings | None = None) -> None:
+        self.settings = settings or AppSettings()
 
     async def retrieve(self, query: str) -> Optional[RetrievedRecipe]:
-        if not self.enabled:
+        if not self.settings.bing_enabled:
             return None
 
         enhanced_query = f"{query} site:xiaohongshu.com"
@@ -163,7 +183,7 @@ class BingSearchStrategy(RetrievalStrategy_ABC):
             async with httpx.AsyncClient(timeout=10) as client:
                 response = await client.get(
                     "https://api.bing.microsoft.com/v7.0/search",
-                    headers={"Ocp-Apim-Subscription-Key": self.api_key},
+                    headers={"Ocp-Apim-Subscription-Key": self.settings.bing_search_api_key},
                     params={"q": enhanced_query, "count": 5, "freshness": "Month"},
                 )
                 response.raise_for_status()
@@ -171,8 +191,7 @@ class BingSearchStrategy(RetrievalStrategy_ABC):
             logger.debug("Bing search failed: %s", exc)
             return None
 
-        payload = response.json()
-        values = payload.get("webPages", {}).get("value", [])
+        values = response.json().get("webPages", {}).get("value", [])
         if not values:
             return None
 
@@ -187,72 +206,66 @@ class BingSearchStrategy(RetrievalStrategy_ABC):
 
 
 class PlaywrightStrategy(RetrievalStrategy_ABC):
-    """
-    Dynamic fallback fetch with random delay and captcha fuse logic.
-    """
+    def __init__(self, settings: AppSettings | None = None) -> None:
+        self.settings = settings or AppSettings()
 
     async def retrieve(self, query: str) -> Optional[RetrievedRecipe]:
         if async_playwright is None:
             return None
 
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=True)
                 user_agent = UserAgent().random if UserAgent is not None else None
                 page = await browser.new_page(user_agent=user_agent)
-
-                await page.add_init_script(self._get_stealth_script())
-                await page.goto(
-                    f"https://www.xiachufang.com/search/?kw={query}",
-                    wait_until="load",
-                )
-                await asyncio.sleep(random.uniform(1.5, 4.3))
-
-                if await self._has_captcha(page):
-                    raise CaptchaDetectedError(f"captcha detected for query={query}")
-
-                recipe_data = await self._extract_recipe(page)
-                await browser.close()
+                try:
+                    await page.add_init_script(self._stealth_script())
+                    await page.goto(
+                        f"https://www.xiachufang.com/search/?kw={query}",
+                        wait_until="domcontentloaded",
+                    )
+                    await asyncio.sleep(
+                        random.uniform(
+                            self.settings.random_delay_min,
+                            self.settings.random_delay_max,
+                        )
+                    )
+                    if await self._has_captcha(page):
+                        raise CaptchaDetectedError(query)
+                    recipe = await self._extract_recipe(page)
+                finally:
+                    await browser.close()
         except CaptchaDetectedError:
             return None
         except Exception as exc:
             logger.debug("Playwright retrieval failed: %s", exc)
             return None
 
-        if not recipe_data:
+        if not recipe:
             return None
 
         return RetrievedRecipe(
             source_query=query,
             source_strategy=RetrievalStrategy.PLAYWRIGHT,
-            title=recipe_data.get("title", ""),
-            ingredients=recipe_data.get("ingredients", []),
-            instructions_or_snippet=recipe_data.get("instructions", ""),
-            raw_content=json.dumps(recipe_data, ensure_ascii=False),
+            title=recipe.get("title", ""),
+            ingredients=recipe.get("ingredients", []),
+            instructions_or_snippet=recipe.get("instructions", ""),
+            raw_content=json.dumps(recipe, ensure_ascii=False),
         )
 
     @staticmethod
-    def _get_stealth_script() -> str:
+    def _stealth_script() -> str:
         return """
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
         window.chrome = { runtime: {} };
         """
 
-    @staticmethod
-    async def _has_captcha(page) -> bool:
-        captcha_selectors = [
-            "secsdk-captcha",
-            "verify-bar",
-            ".captcha",
-            "[class*='captcha']",
-        ]
-        for selector in captcha_selectors:
-            try:
-                if await page.query_selector(selector):
-                    return True
-            except Exception:
-                continue
-        return False
+    async def _has_captcha(self, page) -> bool:
+        if not self.settings.captcha_detection_enabled:
+            return False
+        content = await page.content()
+        markers = ("secsdk-captcha", "verify-bar", "captcha", "人机验证")
+        return any(marker in content for marker in markers)
 
     @staticmethod
     async def _extract_recipe(page) -> Optional[dict[str, Any]]:
@@ -269,24 +282,20 @@ class PlaywrightStrategy(RetrievalStrategy_ABC):
             )
         except Exception:
             return None
-
         if not recipe or not recipe.get("title"):
             return None
         return recipe
 
 
 class FallbackRetriever:
-    """
-    Query-level retrieval cascade:
-    MCP -> Schema -> Bing -> Playwright
-    """
-
-    def __init__(self, strategies=None):
+    def __init__(self, strategies=None, settings: AppSettings | None = None):
+        self.settings = settings or AppSettings()
+        self.xhs_manager = XHSServiceManager(self.settings)
         self.strategies = strategies or [
-            MCPRetrievalStrategy(),
+            MCPRetrievalStrategy(self.settings, self.xhs_manager),
             SchemaExtractionStrategy(),
-            BingSearchStrategy(),
-            PlaywrightStrategy(),
+            BingSearchStrategy(self.settings),
+            PlaywrightStrategy(self.settings),
         ]
 
     async def retrieve_query(self, query: str) -> tuple[RetrievedRecipe | None, dict]:
@@ -300,7 +309,6 @@ class FallbackRetriever:
                     "title": result.title,
                     "message": "strategy hit",
                 }
-
         return None, {
             "query": query,
             "status": "fail",
@@ -309,17 +317,12 @@ class FallbackRetriever:
             "message": "all strategies exhausted",
         }
 
-    async def retrieve_with_fallback(self, query: str) -> Optional[RetrievedRecipe]:
-        """Compatibility helper retained for existing callers."""
-        result, _ = await self.retrieve_query(query)
-        return result
-
     async def batch_retrieve(
         self, queries: list[str], max_concurrent: int = 3
     ) -> tuple[list[RetrievedRecipe], list[dict]]:
         semaphore = asyncio.Semaphore(max_concurrent)
 
-        async def retrieve_with_semaphore(query: str):
+        async def guarded(query: str):
             async with semaphore:
                 try:
                     return await self.retrieve_query(query)
@@ -332,15 +335,11 @@ class FallbackRetriever:
                         "message": str(exc),
                     }
 
-        tasks = [retrieve_with_semaphore(query) for query in queries]
-        results = await asyncio.gather(*tasks)
-
-        success_results = [recipe for recipe, _ in results if recipe is not None]
+        results = await asyncio.gather(*(guarded(query) for query in queries))
+        recipes = [recipe for recipe, _ in results if recipe is not None]
         updates = [meta for _, meta in results]
-        return success_results, updates
+        return recipes, updates
 
 
 async def retrieve_recipes(queries: list[str]) -> tuple[list[RetrievedRecipe], list[dict]]:
-    """Convenience wrapper for batch retrieval."""
-    retriever = FallbackRetriever()
-    return await retriever.batch_retrieve(queries)
+    return await FallbackRetriever().batch_retrieve(queries)

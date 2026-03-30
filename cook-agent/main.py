@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -12,11 +11,16 @@ from fastapi import FastAPI, Query
 from sse_starlette import EventSourceResponse
 
 from agent import process_agent_stream
+from settings import AppSettings
+from xhs_service import XHSServiceManager
 
 load_dotenv()
 
+settings = AppSettings()
+xhs_manager = XHSServiceManager(settings)
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level=settings.backend_log_level.upper(),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
@@ -49,6 +53,23 @@ async def cors_middleware(request, call_next):
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "service": "meal-plan-agent"}
+
+
+@app.post("/api/v1/xhs/login/start")
+async def xhs_login_start():
+    result = xhs_manager.start_login()
+    return {"success": True, "data": result}
+
+
+@app.get("/api/v1/xhs/login/status")
+async def xhs_login_status():
+    return {"success": True, "data": xhs_manager.login_status()}
+
+
+@app.post("/api/v1/xhs/mcp/start")
+async def xhs_mcp_start():
+    base_url = xhs_manager.ensure_mcp_server()
+    return {"success": True, "data": {"base_url": base_url}}
 
 
 @app.get("/api/v1/stream_meal_plan")
@@ -87,8 +108,8 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "main:app",
-        host=os.getenv("BACKEND_HOST", "0.0.0.0"),
-        port=int(os.getenv("BACKEND_PORT", 8000)),
-        log_level=os.getenv("BACKEND_LOG_LEVEL", "info"),
+        host=settings.backend_host,
+        port=settings.backend_port,
+        log_level=settings.backend_log_level,
         reload=True,
     )

@@ -8,7 +8,7 @@ def test_settings_flags_without_optional_credentials(monkeypatch):
     monkeypatch.delenv("XHS_COOKIE", raising=False)
     monkeypatch.delenv("A1", raising=False)
 
-    settings = AppSettings()
+    settings = AppSettings(_env_file=None)
 
     assert settings.openai_enabled is False
     assert settings.bing_enabled is False
@@ -17,15 +17,25 @@ def test_settings_flags_without_optional_credentials(monkeypatch):
 
 def test_settings_flags_treat_whitespace_credentials_as_disabled(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "   ")
+    monkeypatch.setenv("GEMINI_API_KEY", "   ")
     monkeypatch.setenv("BING_SEARCH_API_KEY", "\t")
     monkeypatch.setenv("XHS_COOKIE", "cookie")
     monkeypatch.setenv("A1", " ")
 
-    settings = AppSettings()
+    settings = AppSettings(_env_file=None)
 
     assert settings.openai_enabled is False
+    assert settings.gemini_enabled is False
     assert settings.bing_enabled is False
     assert settings.mcp_enabled is False
+
+
+def test_settings_flags_enable_gemini_when_key_present(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "real-key")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.gemini_enabled is True
 
 
 def test_retrieval_update_payload_keeps_strategy_and_message():
