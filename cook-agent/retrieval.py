@@ -1,5 +1,5 @@
 """Retrieval cascade:
-MCP service -> Schema(JSON-LD) -> Bing(title/snippet) -> Playwright.
+MCP service -> Schema detail-page JSON-LD -> Bing -> Playwright fallback.
 """
 
 from __future__ import annotations
@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
@@ -100,17 +101,39 @@ class SchemaExtractionStrategy(RetrievalStrategy_ABC):
                 return result
         return None
 
-    async def _fetch_and_parse(self, query: str, website: dict[str, str]) -> Optional[RetrievedRecipe]:
-        url = website["url_template"].format(query)
+    async def _fetch_text(self, url: str) -> str:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.text
+
+    async def _fetch_and_parse(
+        self, query: str, website: dict[str, str]
+    ) -> Optional[RetrievedRecipe]:
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.get(url, follow_redirects=True)
-                response.raise_for_status()
+            search_html = await self._fetch_text(website["url_template"].format(query))
         except Exception as exc:
-            logger.debug("Schema fetch failed for %s: %s", website["name"], exc)
+            logger.debug("Schema search fetch failed for %s: %s", website["name"], exc)
             return None
 
-        soup = BeautifulSoup(response.content, "lxml")
+        recipe = self._parse_html_for_recipe(query, search_html)
+        if recipe is not None:
+            return recipe
+
+        detail_links = self._extract_detail_links(search_html, website["name"])
+        for detail_url in detail_links[:5]:
+            try:
+                detail_html = await self._fetch_text(detail_url)
+            except Exception as exc:
+                logger.debug("Schema detail fetch failed for %s: %s", detail_url, exc)
+                continue
+            recipe = self._parse_html_for_recipe(query, detail_html)
+            if recipe is not None:
+                return recipe
+        return None
+
+    def _parse_html_for_recipe(self, query: str, html: str) -> Optional[RetrievedRecipe]:
+        soup = BeautifulSoup(html, "lxml")
         scripts = soup.find_all("script", {"type": "application/ld+json"})
         for script in scripts:
             raw = script.string or script.get_text() or ""
@@ -125,6 +148,20 @@ class SchemaExtractionStrategy(RetrievalStrategy_ABC):
             if recipe_schema is not None:
                 return self._parse_recipe_schema(recipe_schema, query)
         return None
+
+    def _extract_detail_links(self, html: str, site_name: str) -> list[str]:
+        if site_name == "xiachufang":
+            relative_links = re.findall(r'(/recipe/\d+/)', html)
+            links = [f"https://www.xiachufang.com{path}" for path in relative_links]
+            links.extend(re.findall(r'https://www\.xiachufang\.com/recipe/\d+/', html))
+            return list(dict.fromkeys(links))
+        if site_name == "meishij":
+            links = re.findall(r'https://www\.meishij\.net/zuofa/[^"\']+\.html', html)
+            return list(dict.fromkeys(links))
+        if site_name == "douguo":
+            links = re.findall(r'https://www\.douguo\.com/cookbook/\d+\.html', html)
+            return list(dict.fromkeys(links))
+        return []
 
     def _extract_recipe_schema(self, data: Any) -> Optional[dict[str, Any]]:
         if isinstance(data, dict):
@@ -232,7 +269,33 @@ class PlaywrightStrategy(RetrievalStrategy_ABC):
                     )
                     if await self._has_captcha(page):
                         raise CaptchaDetectedError(query)
-                    recipe = await self._extract_recipe(page)
+
+                    search_html = await page.content()
+                    detail_links = SchemaExtractionStrategy()._extract_detail_links(
+                        search_html, "xiachufang"
+                    )
+                    for detail_url in detail_links[:3]:
+                        await page.goto(detail_url, wait_until="domcontentloaded")
+                        await asyncio.sleep(
+                            random.uniform(
+                                self.settings.random_delay_min,
+                                self.settings.random_delay_max,
+                            )
+                        )
+                        if await self._has_captcha(page):
+                            raise CaptchaDetectedError(query)
+                        recipe = await self._extract_recipe(page)
+                        if self._should_fuse_missing_content(recipe):
+                            raise CaptchaDetectedError(f"missing detail content for {query}")
+                        if recipe is not None:
+                            return RetrievedRecipe(
+                                source_query=query,
+                                source_strategy=RetrievalStrategy.PLAYWRIGHT,
+                                title=recipe.get("title", ""),
+                                ingredients=recipe.get("ingredients", []),
+                                instructions_or_snippet=recipe.get("instructions", ""),
+                                raw_content=json.dumps(recipe, ensure_ascii=False),
+                            )
                 finally:
                     await browser.close()
         except CaptchaDetectedError:
@@ -241,17 +304,7 @@ class PlaywrightStrategy(RetrievalStrategy_ABC):
             logger.debug("Playwright retrieval failed: %s", exc)
             return None
 
-        if not recipe:
-            return None
-
-        return RetrievedRecipe(
-            source_query=query,
-            source_strategy=RetrievalStrategy.PLAYWRIGHT,
-            title=recipe.get("title", ""),
-            ingredients=recipe.get("ingredients", []),
-            instructions_or_snippet=recipe.get("instructions", ""),
-            raw_content=json.dumps(recipe, ensure_ascii=False),
-        )
+        return None
 
     @staticmethod
     def _stealth_script() -> str:
@@ -268,23 +321,17 @@ class PlaywrightStrategy(RetrievalStrategy_ABC):
         return any(marker in content for marker in markers)
 
     @staticmethod
+    def _should_fuse_missing_content(recipe: Optional[dict[str, Any]]) -> bool:
+        return not recipe or not recipe.get("title")
+
+    @staticmethod
     async def _extract_recipe(page) -> Optional[dict[str, Any]]:
         try:
-            recipe = await page.evaluate(
-                """
-                () => {
-                    const title = document.querySelector('h1.recipe-title')?.textContent || '';
-                    const ingredients = Array.from(document.querySelectorAll('.ingredient-item')).map(el => el.textContent || '');
-                    const instructions = document.querySelector('.cooking-steps')?.textContent || '';
-                    return { title, ingredients, instructions };
-                }
-                """
-            )
+            html = await page.content()
         except Exception:
             return None
-        if not recipe or not recipe.get("title"):
-            return None
-        return recipe
+
+        return SchemaExtractionStrategy()._parse_html_for_recipe("playwright", html).model_dump() if SchemaExtractionStrategy()._parse_html_for_recipe("playwright", html) else None
 
 
 class FallbackRetriever:
