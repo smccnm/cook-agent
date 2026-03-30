@@ -33,6 +33,7 @@ class RetrievedRecipe(BaseModel):
     title: str = ""
     ingredients: list[str] = Field(default_factory=list)
     instructions_or_snippet: str = ""
+    source_url: str = ""
     raw_content: str | None = None
 
 
@@ -67,6 +68,7 @@ class RetrievalUpdateData(BaseModel):
     status: str
     strategy: str = ""
     title: str = ""
+    source_url: str = ""
     message: str = ""
 
 

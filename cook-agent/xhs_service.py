@@ -29,6 +29,14 @@ def build_cookie_header(cookies: list[dict[str, Any]]) -> str:
     return "; ".join(parts)
 
 
+def build_xhs_note_url(note_id: str, xsec_token: str) -> str:
+    if not note_id:
+        return ""
+    if xsec_token:
+        return f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token={xsec_token}&xsec_source=pc_search"
+    return f"https://www.xiaohongshu.com/explore/{note_id}"
+
+
 class XHSServiceManager:
     def __init__(self, settings: AppSettings | None = None) -> None:
         self.settings = settings or AppSettings()

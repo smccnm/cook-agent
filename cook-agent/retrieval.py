@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
 
 from models import RetrievedRecipe, RetrievalStrategy
 from settings import AppSettings
-from xhs_service import XHSServiceManager
+from xhs_service import XHSServiceManager, build_xhs_note_url
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,7 @@ class MCPRetrievalStrategy(RetrievalStrategy_ABC):
             source_strategy=RetrievalStrategy.MCP,
             title=str(title),
             instructions_or_snippet=str(snippet),
+            source_url=build_xhs_note_url(str(first.get("id", "")), str(first.get("xsecToken", ""))),
             raw_content=json.dumps(first, ensure_ascii=False),
         )
 
@@ -203,6 +204,7 @@ class SchemaExtractionStrategy(RetrievalStrategy_ABC):
             title=str(schema_data.get("name", "")),
             ingredients=[str(item) for item in ingredients],
             instructions_or_snippet=instructions,
+            source_url=str(schema_data.get("url", "")),
             raw_content=json.dumps(schema_data, ensure_ascii=False),
         )
 
@@ -238,6 +240,7 @@ class BingSearchStrategy(RetrievalStrategy_ABC):
             source_strategy=RetrievalStrategy.BING,
             title=str(first.get("name", "")),
             instructions_or_snippet=str(first.get("snippet", "")),
+            source_url=str(first.get("url", "")),
             raw_content=json.dumps(first, ensure_ascii=False),
         )
 
@@ -294,6 +297,7 @@ class PlaywrightStrategy(RetrievalStrategy_ABC):
                                 title=recipe.get("title", ""),
                                 ingredients=recipe.get("ingredients", []),
                                 instructions_or_snippet=recipe.get("instructions", ""),
+                                source_url=detail_url,
                                 raw_content=json.dumps(recipe, ensure_ascii=False),
                             )
                 finally:
@@ -354,6 +358,7 @@ class FallbackRetriever:
                     "status": "success",
                     "strategy": str(result.source_strategy),
                     "title": result.title,
+                    "source_url": result.source_url,
                     "message": "strategy hit",
                 }
         return None, {
@@ -361,6 +366,7 @@ class FallbackRetriever:
             "status": "fail",
             "strategy": "",
             "title": "",
+            "source_url": "",
             "message": "all strategies exhausted",
         }
 
@@ -379,6 +385,7 @@ class FallbackRetriever:
                         "status": "fail",
                         "strategy": "",
                         "title": "",
+                        "source_url": "",
                         "message": str(exc),
                     }
 

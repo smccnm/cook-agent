@@ -38,6 +38,9 @@ KNOWN_INGREDIENTS = (
     "排骨",
     "虾",
     "鱼",
+    "火腿肠",
+    "圆白菜",
+    "米饭",
 )
 
 STOP_WORDS = {
@@ -86,6 +89,10 @@ def _dedupe(items: Iterable[str]) -> list[str]:
 def _normalize_name(name: str) -> str:
     if name == "西红柿":
         return "番茄"
+    if name.endswith("火腿"):
+        return "火腿肠"
+    if name.endswith("白菜") and "圆" in name:
+        return "圆白菜"
     return name.strip()
 
 
@@ -114,13 +121,17 @@ def extract_ingredients(user_input: str) -> list[IngredientItem]:
     seen: set[str] = set()
 
     quantity_pattern = re.compile(
-        r"(\d+\s*(?:个|克|g|kg|斤|两|ml|毫升)?)\s*([\u4e00-\u9fff]{1,8})"
+        r"(\d+\s*(?:个|根|克|g|kg|斤|两|碗|ml|毫升)?)\s*([\u4e00-\u9fff]{1,12})"
     )
     for match in quantity_pattern.finditer(user_input):
         quantity = match.group(1).strip()
         name = _normalize_name(match.group(2).strip())
         if _contains_stop_word(name) or name in seen:
             continue
+        for candidate in ("火腿肠", "圆白菜", "鸡蛋", "剩米饭", "米饭"):
+            if candidate in name:
+                name = "米饭" if candidate == "剩米饭" else candidate
+                break
         ingredients.append(IngredientItem(name=name, quantity=quantity))
         seen.add(name)
 
@@ -187,8 +198,9 @@ def build_keyword_queries(
 
     classic_pairs = {
         frozenset({"土豆", "茄子"}): ["少油版 地三鲜", "空气炸锅 地三鲜"],
-        frozenset({"番茄", "鸡蛋"}): ["番茄 炒蛋 家常", "番茄 鸡蛋 汤"],
+        frozenset({"番茄", "鸡蛋"}): ["番茄炒蛋 家常", "西红柿炒鸡蛋 快手", "番茄 鸡蛋 汤"],
         frozenset({"豆腐", "白菜"}): ["豆腐 白菜 清淡", "白菜 豆腐 汤"],
+        frozenset({"圆白菜", "火腿肠", "米饭"}): ["圆白菜 火腿肠 蛋炒饭 一锅出", "火腿肠 圆白菜 炒饭 快手"],
     }
     existing = set(ingredient_names)
     for pair, pair_queries in classic_pairs.items():

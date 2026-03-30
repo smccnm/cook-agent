@@ -106,7 +106,13 @@ def render_retrieval_status(slot) -> None:
                 for item in updates:
                     strategy = item.get("strategy", "")
                     title = item.get("title", "")
-                    st.write(f"- {item.get('query')} | {item.get('status')} | {strategy} | {title}")
+                    source_url = item.get("source_url", "")
+                    if source_url:
+                        st.markdown(
+                            f"- `{item.get('query')}` | {item.get('status')} | {strategy} | [{title or '查看详情'}]({source_url})"
+                        )
+                    else:
+                        st.write(f"- {item.get('query')} | {item.get('status')} | {strategy} | {title}")
                 status.update(label="Node 2: 检索中 / 已更新", state="running")
             else:
                 st.info("等待检索进度...")
