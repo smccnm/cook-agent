@@ -11,17 +11,50 @@ from google.genai import types
 from models import IngredientItem, UserMenuConstraints
 from settings import AppSettings
 
-PLANNING_SYSTEM_PROMPT = """你是一个极其严谨的美食统筹大脑兼高级搜索算法工程师。
-你的任务是把用户模糊、非结构化的自然语言需求转换为严格的 JSON 规划书。
+PLANNING_SYSTEM_PROMPT = """# ROLE
 
-必须遵守：
-1. 精确提取食材名称和数量，未说明数量时填“适量”。
-2. 提取绝对忌口，放入 allergies_and_dislikes。
-3. 结合原始食材组合、经典菜名猜想、宏观场景补足，输出 4 到 8 个 search_queries。
-4. search_queries 必须是“关键词空格组合”，不能是完整句子。
-5. 如果用户不吃某类食材，绝不能在 query 中引入冲突菜名或关键词。
+你是一个极其严谨的美食统筹大脑兼高级搜索算法工程师。你的任务是将用户模糊、非结构化的自然语言，转化为高度结构化的 JSON 规划书。
 
-输出必须严格符合 UserMenuConstraints 对应 JSON 结构，不要输出解释文字。"""
+# INPUT
+
+用户的原始需求：{user_input}
+
+# RULES & CONSTRAINTS
+
+你必须严格遵守以下规则提取和推导信息：
+
+1.【食材量化规则 (Ingredient Parsing)】
+
+- 精确提取数量：将数量与名称分离，如“三个番茄” -> [{"name": "番茄", "quantity": "3个"}]。模糊量词填“适量”。
+
+2.【全局约束与忌口提取 (Constraints & Allergies)】
+
+- 隐性需求转化：“晚上吃” -> “易消化”；“做两菜一汤” -> 记录到 global_requests。
+- 绝对红线提取：提取所有“过敏”、“不吃”、“讨厌”的食材，填入 allergies_and_dislikes。
+- 偏好提取：提取“减脂”、“清淡”、“要辣”等偏好，填入 flavor_preferences。
+
+3.【全量召回与红线校验策略 (Full-Recall Query Engineering) - 核心任务】
+
+为了最大化搜索范围并严守用户底线，你必须推导并输出 4 到 8 个 search_queries。这些 query 必须按以下三种维度混合生成，且每一个 query 都必须绑定用户的特殊偏好（如减脂、不辣），并绝对排除忌口！
+
+- 维度一（原始食材广撒网）：很多优秀菜谱不写具体菜名。你必须直接用原始食材进行两两或三三组合，加上烹饪目的。
+  例（土豆+茄子+减脂）：["土豆 茄子 神仙吃法 减脂", "茄子 土豆 做法 少油"]
+
+- 维度二（精准菜名击打）：根据食材组合猜想经典菜品，并加上修饰词。
+  例（土豆+茄子+减脂）：["少油版 地三鲜", "空气炸锅 地三鲜"]
+
+- 维度三（宏观场景补足）：如果用户有“两菜一汤”等需求，需专门生成场景词。
+  例（一荤一素）：["快手 纯素菜 清淡", "下饭 荤菜 不辣"]
+
+警告：
+
+- 搜索词必须是“关键词空格组合”，绝对不能是完整的句子！
+- 在生成任何 query 前进行内部红线校验：绝不生成违背 allergies_and_dislikes 的内容。
+
+# OUTPUT FORMAT
+
+严格按照 UserMenuConstraints JSON Schema 输出结果，不要输出任何额外解释性文本。
+"""
 
 KNOWN_INGREDIENTS = (
     "番茄",
@@ -38,9 +71,6 @@ KNOWN_INGREDIENTS = (
     "排骨",
     "虾",
     "鱼",
-    "火腿肠",
-    "圆白菜",
-    "米饭",
 )
 
 STOP_WORDS = {
@@ -89,10 +119,6 @@ def _dedupe(items: Iterable[str]) -> list[str]:
 def _normalize_name(name: str) -> str:
     if name == "西红柿":
         return "番茄"
-    if name.endswith("火腿"):
-        return "火腿肠"
-    if name.endswith("白菜") and "圆" in name:
-        return "圆白菜"
     return name.strip()
 
 
@@ -121,17 +147,13 @@ def extract_ingredients(user_input: str) -> list[IngredientItem]:
     seen: set[str] = set()
 
     quantity_pattern = re.compile(
-        r"(\d+\s*(?:个|根|克|g|kg|斤|两|碗|ml|毫升)?)\s*([\u4e00-\u9fff]{1,12})"
+        r"(\d+\s*(?:个|克|g|kg|斤|两|ml|毫升)?)\s*([\u4e00-\u9fff]{1,8})"
     )
     for match in quantity_pattern.finditer(user_input):
         quantity = match.group(1).strip()
         name = _normalize_name(match.group(2).strip())
         if _contains_stop_word(name) or name in seen:
             continue
-        for candidate in ("火腿肠", "圆白菜", "鸡蛋", "剩米饭", "米饭"):
-            if candidate in name:
-                name = "米饭" if candidate == "剩米饭" else candidate
-                break
         ingredients.append(IngredientItem(name=name, quantity=quantity))
         seen.add(name)
 
@@ -191,16 +213,18 @@ def build_keyword_queries(
     scene_terms = [item for item in global_requests.split("；") if item]
 
     for combo_size in (2, 3):
-        for combo in combinations(ingredient_names[:4], min(combo_size, len(ingredient_names[:4]))):
+        count = min(combo_size, len(ingredient_names[:4]))
+        if count < 2:
+            continue
+        for combo in combinations(ingredient_names[:4], count):
             base = " ".join(combo)
-            queries.append(f"{base} 做法")
             queries.append(f"{base} 神仙吃法")
+            queries.append(f"{base} 做法")
 
     classic_pairs = {
         frozenset({"土豆", "茄子"}): ["少油版 地三鲜", "空气炸锅 地三鲜"],
         frozenset({"番茄", "鸡蛋"}): ["番茄炒蛋 家常", "西红柿炒鸡蛋 快手", "番茄 鸡蛋 汤"],
         frozenset({"豆腐", "白菜"}): ["豆腐 白菜 清淡", "白菜 豆腐 汤"],
-        frozenset({"圆白菜", "火腿肠", "米饭"}): ["圆白菜 火腿肠 蛋炒饭 一锅出", "火腿肠 圆白菜 炒饭 快手"],
     }
     existing = set(ingredient_names)
     for pair, pair_queries in classic_pairs.items():
@@ -274,10 +298,9 @@ class PlanningService:
     async def _plan_with_gemini(self, user_input: str) -> UserMenuConstraints:
         response = await self.google_client.aio.models.generate_content(
             model=self.settings.gemini_planning_model,
-            contents=user_input,
+            contents=PLANNING_SYSTEM_PROMPT.format(user_input=user_input),
             config=types.GenerateContentConfig(
                 temperature=0.1,
-                system_instruction=PLANNING_SYSTEM_PROMPT,
                 response_mime_type="application/json",
                 response_schema=UserMenuConstraints,
             ),
@@ -297,8 +320,7 @@ class PlanningService:
             model="gpt-4o-mini",
             temperature=0,
             messages=[
-                {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
-                {"role": "user", "content": user_input},
+                {"role": "system", "content": PLANNING_SYSTEM_PROMPT.format(user_input=user_input)},
             ],
             response_format={"type": "json_object"},
         )
