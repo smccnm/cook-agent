@@ -13,8 +13,13 @@ if not exist "venv" (
 )
 
 set "PYTHON_EXE=%CD%\venv\Scripts\python.exe"
+set "STREAMLIT_EXE=%CD%\venv\Scripts\streamlit.exe"
 if not exist "%PYTHON_EXE%" (
     echo [setup] Virtual environment python not found.
+    exit /b 1
+)
+if not exist "%STREAMLIT_EXE%" (
+    echo [setup] Virtual environment streamlit not found.
     exit /b 1
 )
 
@@ -30,7 +35,7 @@ if not exist ".env" (
 )
 
 echo [backend] Starting FastAPI backend...
-start "" "%PYTHON_EXE%" main.py
+powershell -NoProfile -Command "Start-Process -FilePath '%PYTHON_EXE%' -ArgumentList 'main.py' -WorkingDirectory '%CD%' -WindowStyle Hidden"
 
 echo [backend] Waiting for health check...
 set /a WAIT_COUNT=0
@@ -48,5 +53,5 @@ goto wait_backend
 :backend_ready
 echo [backend] Ready at http://localhost:8000
 echo [frontend] Launching Streamlit at http://localhost:8501
-start "" "%PYTHON_EXE%" -m streamlit run app.py --server.port 8501
-echo [frontend] Streamlit launched in a separate window.
+powershell -NoProfile -Command "Start-Process -FilePath '%STREAMLIT_EXE%' -ArgumentList 'run','app.py','--server.port','8501' -WorkingDirectory '%CD%' -WindowStyle Hidden"
+echo [frontend] Streamlit launched in background.
