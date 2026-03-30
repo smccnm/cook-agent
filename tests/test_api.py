@@ -21,7 +21,13 @@ def test_stream_route_emits_expected_event_names(monkeypatch):
         yield {"event": "planning_done", "data": {"search_queries": ["q1"]}}
         yield {
             "event": "retrieval_update",
-            "data": {"query": "q1", "status": "success"},
+            "data": {
+                "query": "q1",
+                "status": "success",
+                "strategy": "MCP",
+                "title": "番茄炒蛋",
+                "source_url": "https://www.xiaohongshu.com/explore/test",
+            },
         }
         yield {"event": "recipe_stream", "data": {"chunk": "hello"}}
 
@@ -38,6 +44,7 @@ def test_stream_route_emits_expected_event_names(monkeypatch):
     assert "planning_done" in body
     assert "retrieval_update" in body
     assert "recipe_stream" in body
+    assert "source_url" in body
 
 
 def test_stream_route_works_without_optional_credentials(monkeypatch):
