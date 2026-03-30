@@ -1,15 +1,31 @@
-"""Local-stable meal generation services."""
+"""Meal-plan generation with Gemini-first streaming and local fallback."""
 
 from __future__ import annotations
 
-import os
 from typing import AsyncGenerator
+
+from google import genai
+from google.genai import types
 
 from models import RetrievedRecipe, UserMenuConstraints
 from settings import AppSettings
 
+CHEF_SYSTEM_PROMPT = """你是一位拥有严密逻辑和极高厨艺水准的米其林行政总厨，同时也是库存管理大师。
 
-def chunk_text(text: str, size: int = 60) -> list[str]:
+请严格遵守：
+1. 绝对不能超发库存。
+2. 必须先做“总厨算账总结”，解释食材如何分配。
+3. 必须剔除参考灵感里与忌口冲突的内容。
+4. 输出必须是 Markdown，不要输出 JSON。
+5. 第一段标题必须为：### 👨‍🍳 总厨算账总结
+6. 后续每道菜都使用：
+   - `### 菜名`
+   - `#### 精确用料`
+   - `#### 烹饪步骤`
+"""
+
+
+def chunk_text(text: str, size: int = 80) -> list[str]:
     if not text:
         return []
     return [text[index : index + size] for index in range(0, len(text), size)]
@@ -40,11 +56,7 @@ class LocalMealPlanService:
         for index, item in enumerate(constraints.available_ingredients, start=1):
             dish_label = "主菜" if index == 1 else f"配菜{index - 1}"
             allocations.append(
-                {
-                    "name": item.name,
-                    "quantity": item.quantity,
-                    "dish": dish_label,
-                }
+                {"name": item.name, "quantity": item.quantity, "dish": dish_label}
             )
         return allocations
 
@@ -56,12 +68,12 @@ class LocalMealPlanService:
                 f"{item['quantity']}{item['name']}用于{item['dish']}" for item in allocations
             )
         else:
-            allocation_text = "当前库存未识别到明确主食材，按灵活家常菜方案处理。"
+            allocation_text = "当前库存未识别到明确主食材，按灵活家常餐方案处理。"
 
         return (
             "### 👨‍🍳 总厨算账总结\n\n"
             f"为了满足“{constraints.global_requests or '灵活家常餐'}”的需求，"
-            f"我先按库存做了保守分配：{allocation_text}"
+            f"我先按库存做了保守分配：{allocation_text}。"
         )
 
     def build_dishes(
@@ -78,37 +90,19 @@ class LocalMealPlanService:
         )
 
         dishes: list[str] = []
-        if allocations:
-            primary = allocations[0]
+        for item in allocations[:2]:
             dishes.append(
                 "\n".join(
                     [
-                        f"### {primary['name']}家常主菜",
+                        f"### {item['name']}家常菜",
                         "#### 精确用料",
-                        f"- {primary['name']}: {primary['quantity']}",
+                        f"- {item['name']}: {item['quantity']}",
                         "- 盐: 适量",
                         "- 生抽: 适量",
                         "#### 烹饪步骤",
-                        f"1. 先处理{primary['name']}，按库存量全部用于主菜准备。",
-                        "2. 热锅后先下主料，再用少量基础调味完成主体味型。",
-                        f"3. 最后参考灵感微调火候与口味：{inspiration_text}",
-                    ]
-                )
-            )
-
-        if len(allocations) > 1:
-            side = allocations[1]
-            dishes.append(
-                "\n".join(
-                    [
-                        f"### {side['name']}快手配菜",
-                        "#### 精确用料",
-                        f"- {side['name']}: {side['quantity']}",
-                        "- 食用油: 适量",
-                        "#### 烹饪步骤",
-                        f"1. 将{side['name']}整理成适合快炒或快拌的状态。",
-                        "2. 使用轻调味方式完成，避免与主菜抢味。",
-                        "3. 出锅前确认与用户忌口不冲突。",
+                        f"1. 先处理{item['name']}，按库存量完成切配。",
+                        "2. 热锅后下主料，用基础调味建立主体味型。",
+                        f"3. 参考灵感微调火候与调味：{inspiration_text}",
                     ]
                 )
             )
@@ -123,7 +117,7 @@ class LocalMealPlanService:
                         "#### 烹饪步骤",
                         "1. 优先使用最容易浪费的食材。",
                         "2. 采用一锅或一盘完成的快手做法。",
-                        "3. 保持调味克制，方便后续扩展成完整套餐。",
+                        "3. 保持调味克制并避开用户忌口。",
                     ]
                 )
             )
@@ -157,39 +151,48 @@ class MealGenerationService:
         settings: AppSettings | None = None,
         local_service: LocalMealPlanService | None = None,
     ) -> None:
-        self.openai_client = openai_client
         self.settings = settings or AppSettings()
         self.local_service = local_service or LocalMealPlanService()
+        self.google_client = (
+            genai.Client(api_key=self.settings.gemini_api_key)
+            if self.settings.gemini_enabled
+            else None
+        )
+        self.openai_client = openai_client
 
-    async def _stream_with_openai(
+    async def _stream_with_gemini(
         self,
         constraints: UserMenuConstraints,
         retrieved_recipes: list[RetrievedRecipe],
     ) -> AsyncGenerator[str, None]:
-        prompt = self.local_service.compose_markdown(constraints, retrieved_recipes)
-        response = await self.openai_client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4-turbo-preview"),
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Rewrite the provided draft meal plan as polished markdown. Keep the first heading unchanged.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
+        prompt = (
+            f"库存：{[item.model_dump() for item in constraints.available_ingredients]}\n"
+            f"人数：{constraints.portion_size}\n"
+            f"全局需求：{constraints.global_requests}\n"
+            f"忌口：{constraints.allergies_and_dislikes}\n"
+            f"参考灵感：{[item.model_dump() for item in retrieved_recipes[:6]]}\n"
         )
-        text = response.choices[0].message.content or prompt
-        for chunk in chunk_text(text):
-            yield chunk
+
+        stream = await self.google_client.aio.models.generate_content_stream(
+            model=self.settings.gemini_generation_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=CHEF_SYSTEM_PROMPT,
+                temperature=0.3,
+            ),
+        )
+        async for chunk in stream:
+            if chunk.text:
+                yield chunk.text
 
     async def stream(
         self,
         constraints: UserMenuConstraints,
         retrieved_recipes: list[RetrievedRecipe],
     ) -> AsyncGenerator[str, None]:
-        if self.openai_client and self.settings.openai_enabled:
+        if self.google_client is not None:
             try:
-                async for chunk in self._stream_with_openai(constraints, retrieved_recipes):
+                async for chunk in self._stream_with_gemini(constraints, retrieved_recipes):
                     yield chunk
                 return
             except Exception:

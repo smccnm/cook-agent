@@ -1,34 +1,34 @@
 # Cook Agent
 
-FastAPI + Streamlit meal-planning agent with three visible stages:
+全局统筹私人排菜 Agent，包含：
 
-1. Planning extraction
-2. Retrieval cascade
-3. Streamed meal-plan generation
+1. `Node 1` 统筹规划
+2. `Node 2` 多策略检索瀑布流
+3. `Node 3` 流式总厨生成
 
-## Local No-Credential Mode
+后端使用 FastAPI + SSE，前端使用 Streamlit。
 
-This project is designed to work locally even when optional credentials are missing.
+## 当前默认能力
 
-- No `OPENAI_API_KEY`: planning and generation fall back to deterministic local logic.
-- No `BING_SEARCH_API_KEY`: Bing retrieval is skipped.
-- No `XHS_COOKIE` / `A1`: MCP retrieval is skipped.
+- 主模型：Gemini
+- 兜底：本地规则规划与本地规则菜单生成
+- 检索瀑布流：
+  - Xiaohongshu MCP 本地服务
+  - Schema JSON-LD 提取
+  - Bing 搜索摘要
+  - Playwright 动态后备
 
-The default local experience should still show:
+## 小红书登录
 
-- `planning_done`
-- `retrieval_update`
-- `recipe_stream`
+应用支持手动登录小红书：
 
-## Optional Enhancements
+1. 启动后端与前端
+2. 在 Streamlit 侧边栏点击“打开小红书登录窗口”
+3. 在弹出的官方登录窗口中手动登录
+4. 点击“刷新登录状态”
+5. 登录成功后，应用会同步本地 cookies，并可启动本地 xiaohongshu-mcp 服务
 
-Add credentials in `.env` to enable richer behavior:
-
-- `OPENAI_API_KEY` and `OPENAI_MODEL`
-- `BING_SEARCH_API_KEY`
-- `XHS_COOKIE` and `A1`
-
-## Quick Start
+## 快速开始
 
 ### Windows
 
@@ -42,52 +42,31 @@ start.bat
 ./start.sh
 ```
 
-Both launchers will:
-
-- create `venv` if missing
-- install dependencies
-- create `.env` from `.env.example` if needed
-- start the backend
-- poll `http://localhost:8000/health`
-- launch Streamlit
-
-## Manual Start
+## 手动启动
 
 ```powershell
-python -m venv venv
-venv\Scripts\activate
 pip install -r requirements.txt
 python main.py
 streamlit run app.py
 ```
 
-Backend endpoints:
+## 关键环境变量
 
-- `GET /health`
-- `GET /api/v1/stream_meal_plan`
-- docs at `http://localhost:8000/docs`
+见 `.env.example`，重点包括：
 
-Frontend:
-
-- `http://localhost:8501`
-
-## Test Commands
-
-```powershell
-pytest tests/test_settings_and_models.py tests/test_planning.py tests/test_retrieval.py tests/test_generation.py tests/test_api.py tests/test_stream_client.py -q -p no:cacheprovider
-python -m py_compile settings.py models.py planning.py retrieval.py generation.py agent.py main.py stream_client.py app.py tests/test_settings_and_models.py tests/test_planning.py tests/test_retrieval.py tests/test_generation.py tests/test_api.py tests/test_stream_client.py
-```
-
-## Environment Variables
-
-See `.env.example` for the full list. The most important values are:
-
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
+- `GEMINI_API_KEY`
+- `GEMINI_PLANNING_MODEL`
+- `GEMINI_GENERATION_MODEL`
 - `BING_SEARCH_API_KEY`
 - `XHS_COOKIE`
 - `A1`
-- `BACKEND_HOST`
-- `BACKEND_PORT`
-- `BACKEND_URL`
-- `STREAMLIT_SERVER_PORT`
+- `XHS_MCP_BINARY_PATH`
+- `XHS_LOGIN_BINARY_PATH`
+- `XHS_COOKIES_PATH`
+
+## 测试
+
+```powershell
+pytest tests/test_settings_and_models.py tests/test_planning.py tests/test_retrieval.py tests/test_generation.py tests/test_api.py tests/test_stream_client.py tests/test_xhs_service.py -q -p no:cacheprovider
+python -m py_compile settings.py xhs_service.py planning.py generation.py retrieval.py agent.py main.py stream_client.py app.py tests/test_settings_and_models.py tests/test_planning.py tests/test_retrieval.py tests/test_generation.py tests/test_api.py tests/test_stream_client.py tests/test_xhs_service.py
+```
