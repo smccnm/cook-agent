@@ -42,4 +42,5 @@ goto wait_backend
 :backend_ready
 echo [backend] Ready at http://localhost:8000
 echo [frontend] Launching Streamlit at http://localhost:8501
-streamlit run app.py
+start "" python -m streamlit run app.py --server.port 8501
+echo [frontend] Streamlit launched in a separate window.

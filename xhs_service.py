@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +69,7 @@ class XHSServiceManager:
     def start_login(self) -> dict[str, Any]:
         binary = self.settings.xhs_login_binary
         if not binary.exists():
-            raise FileNotFoundError(f"XHS login binary not found: {binary}")
+            self.ensure_binaries()
 
         self.settings.xhs_cookies_file.parent.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
@@ -109,7 +110,7 @@ class XHSServiceManager:
 
         binary = self.settings.xhs_mcp_binary
         if not binary.exists():
-            raise FileNotFoundError(f"XHS MCP binary not found: {binary}")
+            self.ensure_binaries()
 
         env = os.environ.copy()
         env["COOKIES_PATH"] = str(self.settings.xhs_cookies_file)
@@ -128,6 +129,27 @@ class XHSServiceManager:
                 time.sleep(1)
 
         raise RuntimeError("XHS MCP server did not become ready")
+
+    def ensure_binaries(self) -> None:
+        if self.settings.xhs_login_binary.exists() and self.settings.xhs_mcp_binary.exists():
+            return
+
+        release_url = (
+            "https://github.com/xpzouying/xiaohongshu-mcp/releases/download/"
+            "v2026.03.09.0605-0e16f4b/xiaohongshu-mcp-windows-amd64.zip"
+        )
+        download_dir = self.settings.project_root / "vendor" / "xiaohongshu-mcp" / "bin"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = download_dir / "xiaohongshu-mcp-windows-amd64.zip"
+
+        if not zip_path.exists():
+            with httpx.Client(timeout=120) as client:
+                response = client.get(release_url)
+                response.raise_for_status()
+                zip_path.write_bytes(response.content)
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(download_dir)
 
     async def search(self, query: str) -> list[dict[str, Any]]:
         base_url = self.ensure_mcp_server()
